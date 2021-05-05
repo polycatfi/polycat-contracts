@@ -296,7 +296,8 @@ contract MasterChef is Ownable, ReentrancyGuard {
     }
 
     // Only update before start of farm
-    function updateStartBlock(uint256 _startBlock) public onlyOwner {
+    function updateStartBlock(uint256 _startBlock) external onlyOwner {
+	    require(startBlock > block.number, "Farm already started");
         startBlock = _startBlock;
     }
 }
