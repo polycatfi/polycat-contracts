@@ -29,8 +29,8 @@ contract StrategyVaultBurn is Ownable, ReentrancyGuard, Pausable {
     address public vaultChefAddress;
     address public govAddress;
 
-    uint256 public lastEarnBlock = block.number;
-    uint256 public wantLockedTotal = 0;
+    uint256 public burnCycle = 6 hours;
+    uint256 public lastEarnBlock = block.timestamp;
     uint256 public sharesTotal = 0;
 
     address public constant buyBackAddress = 0x000000000000000000000000000000000000dEaD;
@@ -56,64 +56,92 @@ contract StrategyVaultBurn is Ownable, ReentrancyGuard, Pausable {
         _resetAllowances();
     }
     
-    event SetSettings(
-        uint256 _slippageFactor
-    );
+    event SetSettings(uint256 _slippageFactor,uint256 _burnCycle);
     
     modifier onlyGov() {
         require(msg.sender == govAddress, "!gov");
         _;
     }
-
+    
     function deposit(address _userAddress, uint256 _wantAmt) external onlyOwner nonReentrant whenNotPaused returns (uint256) {
+        // Call must happen before transfer
+        uint256 wantLockedBefore = wantLockedTotal();
+
         IERC20(wantAddress).safeTransferFrom(
             address(msg.sender),
             address(this),
             _wantAmt
         );
 
-        sharesTotal = sharesTotal.add(_wantAmt);
-        wantLockedTotal = sharesTotal;
+        // Proper deposit amount for tokens with fees, or vaults with deposit fees
+        uint256 sharesAdded = _farm();
+        if (sharesTotal > 0) {
+            sharesAdded = sharesAdded.mul(sharesTotal).div(wantLockedBefore);
+        }
+        sharesTotal = sharesTotal.add(sharesAdded);
 
-        IStakingRewards(quickSwapAddress).stake(_wantAmt);
+        return sharesAdded;
+    }
 
-        return _wantAmt;
+    function _farm() internal returns (uint256) {
+        uint256 wantAmt = IERC20(wantAddress).balanceOf(address(this));
+        if (wantAmt == 0) return 0;
+        
+        uint256 sharesBefore = vaultSharesTotal();
+        IStakingRewards(quickSwapAddress).stake(wantAmt);
+        uint256 sharesAfter = vaultSharesTotal();
+        
+        return sharesAfter.sub(sharesBefore);
     }
 
     function withdraw(address _userAddress, uint256 _wantAmt) external onlyOwner nonReentrant returns (uint256) {
         require(_wantAmt > 0, "_wantAmt is 0");
-
-        IStakingRewards(quickSwapAddress).withdraw(_wantAmt);
-
+        
         uint256 wantAmt = IERC20(wantAddress).balanceOf(address(this));
+        
+        // Check if strategy has tokens from panic
+        if (_wantAmt > wantAmt) {
+            IStakingRewards(quickSwapAddress).withdraw(_wantAmt.sub(wantAmt));
+            wantAmt = IERC20(wantAddress).balanceOf(address(this));
+        }
+
         if (_wantAmt > wantAmt) {
             _wantAmt = wantAmt;
         }
 
-        if (wantLockedTotal < _wantAmt) {
-            _wantAmt = wantLockedTotal;
+        if (_wantAmt > wantLockedTotal()) {
+            _wantAmt = wantLockedTotal();
         }
 
-        sharesTotal = sharesTotal.sub(_wantAmt);
-        wantLockedTotal = sharesTotal;
+        uint256 sharesRemoved = _wantAmt.mul(sharesTotal).div(wantLockedTotal());
+        if (sharesRemoved > sharesTotal) {
+            sharesRemoved = sharesTotal;
+        }
+        sharesTotal = sharesTotal.sub(sharesRemoved);
 
         IERC20(wantAddress).safeTransfer(vaultChefAddress, _wantAmt);
 
-        return _wantAmt;
+        return sharesRemoved;
+    }
+    
+    function earn() external nonReentrant whenNotPaused onlyGov {
+        if (block.timestamp > lastEarnBlock.add(burnCycle)) {
+            burn();
+        } else {
+            lair();
+        }
     }
 
-    function lair() external nonReentrant whenNotPaused onlyGov {
+    function lair() internal {
         IStakingRewards(quickSwapAddress).getReward();
 
         uint256 earnedAmt = IERC20(quickAddress).balanceOf(address(this));
         if (earnedAmt > 0) {
             IDragonLair(dragonLairAddress).enter(earnedAmt);
         }
-
-        lastEarnBlock = block.number;
     }
 
-    function burn() external nonReentrant whenNotPaused onlyGov {
+    function burn() internal {
         uint256 lairBalance = IERC20(dQuickAddress).balanceOf(address(this));
         if (lairBalance > 0) {
             IDragonLair(dragonLairAddress).leave(lairBalance);
@@ -127,15 +155,28 @@ contract StrategyVaultBurn is Ownable, ReentrancyGuard, Pausable {
                 );
             }
         }
+
+        lastEarnBlock = block.timestamp;
     }
 
+    // Emergency!!
     function pause() external onlyGov {
         _pause();
     }
 
+    // False alarm
     function unpause() external onlyGov {
         _unpause();
         _resetAllowances();
+    }
+    
+    function vaultSharesTotal() public view returns (uint256) {
+        return IStakingRewards(quickSwapAddress).balanceOf(address(this));
+    }
+    
+    function wantLockedTotal() public view returns (uint256) {
+        return IERC20(wantAddress).balanceOf(address(this))
+            .add(IStakingRewards(quickSwapAddress).balanceOf(address(this)));
     }
 
     function _resetAllowances() internal {
@@ -161,16 +202,23 @@ contract StrategyVaultBurn is Ownable, ReentrancyGuard, Pausable {
     function resetAllowances() external onlyGov {
         _resetAllowances();
     }
+
+    function panic() external onlyGov {
+        _pause();
+        IStakingRewards(quickSwapAddress).withdraw(vaultSharesTotal());
+    }
+
+    function unpanic() external onlyGov {
+        _unpause();
+        _farm();
+    }
     
-    function setSettings(
-        uint256 _slippageFactor
-    ) external onlyGov {
+    function setSettings(uint256 _slippageFactor,uint256 _burnCycle) external onlyGov {
         require(_slippageFactor <= slippageFactorUL, "_slippageFactor too high");
         slippageFactor = _slippageFactor;
+        burnCycle = _burnCycle;
 
-        emit SetSettings(
-            _slippageFactor
-        );
+        emit SetSettings(_slippageFactor,_burnCycle);
     }
 
     function setGov(address _govAddress) external onlyGov {
