@@ -68,40 +68,40 @@ contract VaultChef is Ownable, ReentrancyGuard, Operators {
 
     // Want tokens moved from user -> this -> Strat (compounding)
     function deposit(uint256 _pid, uint256 _wantAmt) external nonReentrant {
-        _deposit(msg.sender, _pid, _wantAmt);
+        _deposit(_pid, _wantAmt, msg.sender);
+    }
+
+    // For unique contract calls
+    function deposit(uint256 _pid, uint256 _wantAmt, address _to) external nonReentrant onlyOperator {
+        _deposit(_pid, _wantAmt, _to);
+    }
+    
+    function _deposit(uint256 _pid, uint256 _wantAmt, address _to) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][_to];
+
+        if (_wantAmt > 0) {
+            pool.want.safeTransferFrom(msg.sender, address(this), _wantAmt);
+
+            uint256 sharesAdded = IStrategy(poolInfo[_pid].strat).deposit(_to, _wantAmt);
+            user.shares = user.shares.add(sharesAdded);
+        }
+        emit Deposit(_to, _pid, _wantAmt);
     }
 
     // Withdraw LP tokens from MasterChef.
     function withdraw(uint256 _pid, uint256 _wantAmt) external nonReentrant {
-        _withdraw(msg.sender, _pid, _wantAmt);
-    }
-    
-    // For unique contract calls
-    function deposit(address _sender, uint256 _pid, uint256 _wantAmt) public nonReentrant onlyOperator {
-        _deposit(_sender, _pid, _wantAmt);
+        _withdraw(_pid, _wantAmt, msg.sender);
     }
 
     // For unique contract calls
-    function withdraw(address _sender, uint256 _pid, uint256 _wantAmt) public nonReentrant onlyOperator {
-        _withdraw(_sender, _pid, _wantAmt);
-    }
-    
-    function _deposit(address _sender, uint256 _pid, uint256 _wantAmt) internal {
-        PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][_sender];
-
-        if (_wantAmt > 0) {
-            pool.want.safeTransferFrom(_sender, address(this), _wantAmt);
-
-            uint256 sharesAdded = IStrategy(poolInfo[_pid].strat).deposit(_sender, _wantAmt);
-            user.shares = user.shares.add(sharesAdded);
-        }
-        emit Deposit(_sender, _pid, _wantAmt);
+    function withdraw(uint256 _pid, uint256 _wantAmt, address _to) external nonReentrant onlyOperator {
+        _withdraw(_pid, _wantAmt, _to);
     }
 
-    function _withdraw(address _sender, uint256 _pid, uint256 _wantAmt) internal {
+    function _withdraw(uint256 _pid, uint256 _wantAmt, address _to) internal {
         PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][_sender];
+        UserInfo storage user = userInfo[_pid][msg.sender];
 
         uint256 wantLockedTotal = IStrategy(poolInfo[_pid].strat).wantLockedTotal();
         uint256 sharesTotal = IStrategy(poolInfo[_pid].strat).sharesTotal();
@@ -115,7 +115,7 @@ contract VaultChef is Ownable, ReentrancyGuard, Operators {
             _wantAmt = amount;
         }
         if (_wantAmt > 0) {
-            uint256 sharesRemoved = IStrategy(poolInfo[_pid].strat).withdraw(_sender, _wantAmt);
+            uint256 sharesRemoved = IStrategy(poolInfo[_pid].strat).withdraw(msg.sender, _wantAmt);
 
             if (sharesRemoved > user.shares) {
                 user.shares = 0;
@@ -127,14 +127,14 @@ contract VaultChef is Ownable, ReentrancyGuard, Operators {
             if (wantBal < _wantAmt) {
                 _wantAmt = wantBal;
             }
-            pool.want.safeTransfer(_sender, _wantAmt);
+            pool.want.safeTransfer(_to, _wantAmt);
         }
-        emit Withdraw(_sender, _pid, _wantAmt);
+        emit Withdraw(msg.sender, _pid, _wantAmt);
     }
 
     // Withdraw everything from pool for yourself
     function withdrawAll(uint256 _pid) external {
-        withdraw(msg.sender, _pid, uint256(-1));
+        _withdraw(_pid, uint256(-1), msg.sender);
     }
 
     function resetAllowances() external onlyOwner {
