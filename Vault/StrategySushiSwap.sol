@@ -7,25 +7,28 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/utils/Pausable.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/utils/ReentrancyGuard.sol";
 
-import "./libs/IStakingRewards.sol";
+import "./libs/ISushiStake.sol";
 import "./libs/IStrategyFish.sol";
 import "./libs/IUniPair.sol";
 import "./libs/IUniRouter02.sol";
+import "./libs/IWETH.sol";
 
-contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
+contract StrategySushiSwap is Ownable, ReentrancyGuard, Pausable {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
-    address public quickSwapAddress;
+    uint256 public pid;
+    address public constant sushiYieldAddress = 0x0769fd68dFb93167989C6f7254cd0D766Fb2841F;
     address public wantAddress;
     address public token0Address;
     address public token1Address;
     address public earnedAddress;
     
-    address public uniRouterAddress = 0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff;
+    address public uniRouterAddress = 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506;
     address public constant usdcAddress = 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174;
     address public constant fishAddress = 0x3a3Df212b7AA91Aa0402B9035b098891d276572B;
-    address public constant rewardAddress = 0x917FB15E8aAA12264DCBdC15AFef7cD3cE76BA39;
+    address public constant rewardAddress = 0x520C340d6C9D7Efc7cF4806b6cf0Ab9859C62dF5;
+    address public constant wmaticAddress = 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270;
     address public constant vaultAddress = 0x4879712c5D1A98C0B88Fb700daFF5c65d12Fd729;
     address public constant feeAddress = 0x1cb757f1eB92F25A917CE9a92ED88c1aC0734334;
     address public constant withdrawFeeAddress = 0x47231b2EcB18b7724560A78cd7191b121f53FABc;
@@ -52,21 +55,29 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
     address[] public earnedToWmaticPath;
     address[] public earnedToUsdcPath;
     address[] public earnedToFishPath;
+    address[] public wmaticToUsdcPath;
+    address[] public wmaticToFishPath;
     address[] public earnedToToken0Path;
     address[] public earnedToToken1Path;
+    address[] public wmaticToToken0Path;
+    address[] public wmaticToToken1Path;
     address[] public token0ToEarnedPath;
     address[] public token1ToEarnedPath;
 
     constructor(
         address _vaultChefAddress,
-        address _quickSwapAddress,
+        uint256 _pid,
         address _wantAddress,
         address _earnedAddress,
         address[] memory _earnedToWmaticPath,
         address[] memory _earnedToUsdcPath,
         address[] memory _earnedToFishPath,
+        address[] memory _wmaticToUsdcPath,
+        address[] memory _wmaticToFishPath,
         address[] memory _earnedToToken0Path,
         address[] memory _earnedToToken1Path,
+        address[] memory _wmaticToToken0Path,
+        address[] memory _wmaticToToken1Path,
         address[] memory _token0ToEarnedPath,
         address[] memory _token1ToEarnedPath
     ) public {
@@ -77,14 +88,18 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
         token0Address = IUniPair(wantAddress).token0();
         token1Address = IUniPair(wantAddress).token1();
 
-        quickSwapAddress = _quickSwapAddress;
+        pid = _pid;
         earnedAddress = _earnedAddress;
 
         earnedToWmaticPath = _earnedToWmaticPath;
         earnedToUsdcPath = _earnedToUsdcPath;
         earnedToFishPath = _earnedToFishPath;
+        wmaticToUsdcPath = _wmaticToUsdcPath;
+        wmaticToFishPath = _wmaticToFishPath;
         earnedToToken0Path = _earnedToToken0Path;
         earnedToToken1Path = _earnedToToken1Path;
+        wmaticToToken0Path = _wmaticToToken0Path;
+        wmaticToToken1Path = _wmaticToToken1Path;
         token0ToEarnedPath = _token0ToEarnedPath;
         token1ToEarnedPath = _token1ToEarnedPath;
 
@@ -132,7 +147,7 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
         if (wantAmt == 0) return 0;
         
         uint256 sharesBefore = vaultSharesTotal();
-        IStakingRewards(quickSwapAddress).stake(wantAmt);
+        ISushiStake(sushiYieldAddress).deposit(pid, wantAmt, address(this));
         uint256 sharesAfter = vaultSharesTotal();
         
         return sharesAfter.sub(sharesBefore);
@@ -145,7 +160,7 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
         
         // Check if strategy has tokens from panic
         if (_wantAmt > wantAmt) {
-            IStakingRewards(quickSwapAddress).withdraw(_wantAmt.sub(wantAmt));
+            ISushiStake(sushiYieldAddress).withdraw(pid, _wantAmt.sub(wantAmt), address(this));
             wantAmt = IERC20(wantAddress).balanceOf(address(this));
         }
 
@@ -178,15 +193,16 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
 
     function earn() external nonReentrant whenNotPaused onlyGov {
         // Harvest farm tokens
-        IStakingRewards(quickSwapAddress).getReward();
+        ISushiStake(sushiYieldAddress).harvest(pid, address(this));
 
         // Converts farm tokens into want tokens
         uint256 earnedAmt = IERC20(earnedAddress).balanceOf(address(this));
+        uint256 wmaticAmt = IERC20(wmaticAddress).balanceOf(address(this));
 
         if (earnedAmt > 0) {
-            earnedAmt = distributeFees(earnedAmt);
-            earnedAmt = distributeRewards(earnedAmt);
-            earnedAmt = buyBack(earnedAmt);
+            earnedAmt = distributeFees(earnedAmt, earnedAddress);
+            earnedAmt = distributeRewards(earnedAmt, earnedAddress);
+            earnedAmt = buyBack(earnedAmt, earnedAddress);
     
             if (earnedAddress != token0Address) {
                 // Swap half earned to token0
@@ -205,7 +221,33 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
                     address(this)
                 );
             }
+        }
+        
+        if (wmaticAmt > 0) {
+            wmaticAmt = distributeFees(wmaticAmt, wmaticAddress);
+            wmaticAmt = distributeRewards(wmaticAmt, wmaticAddress);
+            wmaticAmt = buyBack(wmaticAmt, wmaticAddress);
     
+            if (wmaticAddress != token0Address) {
+                // Swap half earned to token0
+                _safeSwap(
+                    wmaticAmt.div(2),
+                    wmaticToToken0Path,
+                    address(this)
+                );
+            }
+    
+            if (wmaticAddress != token1Address) {
+                // Swap half earned to token1
+                _safeSwap(
+                    wmaticAmt.div(2),
+                    wmaticToToken1Path,
+                    address(this)
+                );
+            }
+        }
+        
+        if (earnedAmt > 0 || wmaticAmt > 0) {
             // Get want tokens, ie. add liquidity
             uint256 token0Amt = IERC20(token0Address).balanceOf(address(this));
             uint256 token1Amt = IERC20(token1Address).balanceOf(address(this));
@@ -221,7 +263,7 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
                     now.add(600)
                 );
             }
-    
+
             lastEarnBlock = block.number;
     
             _farm();
@@ -229,15 +271,20 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
     }
 
     // To pay for earn function
-    function distributeFees(uint256 _earnedAmt) internal returns (uint256) {
+    function distributeFees(uint256 _earnedAmt, address _earnedAddress) internal returns (uint256) {
         if (controllerFee > 0) {
             uint256 fee = _earnedAmt.mul(controllerFee).div(feeMax);
-    
-            _safeSwapWmatic(
-                fee,
-                earnedToWmaticPath,
-                feeAddress
-            );
+            
+            if (_earnedAddress == wmaticAddress) {
+                IWETH(wmaticAddress).withdraw(fee);
+                safeTransferETH(feeAddress, fee);
+            } else {
+                _safeSwapWmatic(
+                    fee,
+                    earnedToWmaticPath,
+                    feeAddress
+                );
+            }
             
             _earnedAmt = _earnedAmt.sub(fee);
         }
@@ -245,7 +292,7 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
         return _earnedAmt;
     }
 
-    function distributeRewards(uint256 _earnedAmt) internal returns (uint256) {
+    function distributeRewards(uint256 _earnedAmt, address _earnedAddress) internal returns (uint256) {
         if (rewardRate > 0) {
             uint256 fee = _earnedAmt.mul(rewardRate).div(feeMax);
     
@@ -253,7 +300,7 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
             
             _safeSwap(
                 fee,
-                earnedToUsdcPath,
+                _earnedAddress == wmaticAddress ? wmaticToUsdcPath : earnedToUsdcPath,
                 address(this)
             );
             
@@ -267,13 +314,13 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
         return _earnedAmt;
     }
 
-    function buyBack(uint256 _earnedAmt) internal returns (uint256) {
+    function buyBack(uint256 _earnedAmt, address _earnedAddress) internal returns (uint256) {
         if (buyBackRate > 0) {
             uint256 buyBackAmt = _earnedAmt.mul(buyBackRate).div(feeMax);
     
             _safeSwap(
                 buyBackAmt,
-                earnedToFishPath,
+                _earnedAddress == wmaticAddress ? wmaticToFishPath : earnedToFishPath,
                 buyBackAddress
             );
 
@@ -322,23 +369,30 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
     
     
     function vaultSharesTotal() public view returns (uint256) {
-        return IStakingRewards(quickSwapAddress).balanceOf(address(this));
+        (uint256 balance,) = ISushiStake(sushiYieldAddress).userInfo(pid, address(this));
+        return balance;
     }
     
     function wantLockedTotal() public view returns (uint256) {
-        return IERC20(wantAddress).balanceOf(address(this))
-            .add(IStakingRewards(quickSwapAddress).balanceOf(address(this)));
+        (uint256 balance,) = ISushiStake(sushiYieldAddress).userInfo(pid, address(this));
+        return IERC20(wantAddress).balanceOf(address(this)).add(balance);
     }
 
     function _resetAllowances() internal {
-        IERC20(wantAddress).safeApprove(quickSwapAddress, uint256(0));
+        IERC20(wantAddress).safeApprove(sushiYieldAddress, uint256(0));
         IERC20(wantAddress).safeIncreaseAllowance(
-            quickSwapAddress,
+            sushiYieldAddress,
             uint256(-1)
         );
 
         IERC20(earnedAddress).safeApprove(uniRouterAddress, uint256(0));
         IERC20(earnedAddress).safeIncreaseAllowance(
+            uniRouterAddress,
+            uint256(-1)
+        );
+
+        IERC20(wmaticAddress).safeApprove(uniRouterAddress, uint256(0));
+        IERC20(wmaticAddress).safeIncreaseAllowance(
             uniRouterAddress,
             uint256(-1)
         );
@@ -368,7 +422,12 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
 
     function panic() external onlyGov {
         _pause();
-        IStakingRewards(quickSwapAddress).withdraw(vaultSharesTotal());
+        ISushiStake(sushiYieldAddress).withdraw(pid, vaultSharesTotal(), address(this));
+    }
+
+    function emergencyPanic() external onlyGov {
+        _pause();
+        ISushiStake(sushiYieldAddress).emergencyWithdraw(pid, address(this));
     }
 
     function unpanic() external onlyGov {
@@ -442,4 +501,11 @@ contract StrategyQuickSwap is Ownable, ReentrancyGuard, Pausable {
             now.add(600)
         );
     }
+    
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success, ) = to.call{value: value}(new bytes(0));
+        require(success, 'TransferHelper::safeTransferETH: ETH transfer failed');
+    }
+
+    receive() external payable {}
 }
