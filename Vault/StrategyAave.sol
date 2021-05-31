@@ -31,7 +31,7 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
     address public constant wmaticAddress = 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270;
     address public constant usdcAddress = 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174;
     address public constant fishAddress = 0x3a3Df212b7AA91Aa0402B9035b098891d276572B;
-    address public constant rewardAddress = 0x917FB15E8aAA12264DCBdC15AFef7cD3cE76BA39;
+    address public rewardAddress = 0x917FB15E8aAA12264DCBdC15AFef7cD3cE76BA39;
     address public constant vaultAddress = 0x4879712c5D1A98C0B88Fb700daFF5c65d12Fd729;
     address public constant feeAddress = 0x1cb757f1eB92F25A917CE9a92ED88c1aC0734334;
     address public constant withdrawFeeAddress = 0x47231b2EcB18b7724560A78cd7191b121f53FABc;
@@ -130,6 +130,7 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
         uint256 _withdrawFeeFactor,
         uint256 _slippageFactor,
         address _uniRouterAddress,
+        address _rewardAddress,
         uint16 _referralCode
     );
     
@@ -233,7 +234,9 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
      * We stop at _borrow because we need some tokens to deleverage
      */
     function _leverage(uint256 _amount) internal {
-        if (_amount > minLeverage) {
+        if (borrowDepth == 0) {
+            _supply(_amount);
+        } else if (_amount > minLeverage) {
             for (uint256 i = 0; i < borrowDepth; i++) {
                 _supply(_amount);
                 _amount = _amount.mul(borrowRate).div(BORROW_RATE_DIVISOR);
@@ -265,24 +268,26 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
     function _deleverage() internal {
         uint256 wantBal = wantLockedInHere();
 
-        while (wantBal < debtTotal()) {
+        if (borrowDepth > 0) {
+            while (wantBal < debtTotal()) {
+                _repayBorrow(wantBal);
+                _removeSupply(vTokenTotal().sub(supplyBalMin()));
+                wantBal = wantLockedInHere();
+            }
+            
             _repayBorrow(wantBal);
-            _removeSupply(vTokenTotal().sub(supplyBalMin()));
-            wantBal = wantLockedInHere();
         }
-        
-        _repayBorrow(wantBal);
         _removeSupply(uint256(-1));
     }
 
     function earn() external nonReentrant whenNotPaused onlyGov {
-        uint256 preEarn = wantLockedInHere();
+        uint256 preEarn = IERC20(earnedAddress).balanceOf(address(this));
 
         // Harvest farm tokens
         IAaveStake(aaveClaimAddress).claimRewards(vTokenArray, uint256(-1), address(this));
         
         // Because we keep some tokens in this contract, we have to do this if earned is the same as want
-        uint256 earnedAmt = wantLockedInHere().sub(preEarn);
+        uint256 earnedAmt = IERC20(earnedAddress).balanceOf(address(this)).sub(preEarn);
 
         if (earnedAmt > 0) {
             earnedAmt = distributeFees(earnedAmt);
@@ -445,6 +450,7 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
         uint256 _withdrawFeeFactor,
         uint256 _slippageFactor,
         address _uniRouterAddress,
+        address _rewardAddress,
         uint16 _referralCode
     ) external onlyGov {
         require(_controllerFee.add(_rewardRate).add(_buyBackRate) <= feeMaxTotal, "Max fee of 10%");
@@ -457,6 +463,7 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
         withdrawFeeFactor = _withdrawFeeFactor;
         slippageFactor = _slippageFactor;
         uniRouterAddress = _uniRouterAddress;
+        rewardAddress = _rewardAddress;
         referralCode = _referralCode;
 
         emit SetSettings(
@@ -466,6 +473,7 @@ contract StrategyAave is Ownable, ReentrancyGuard, Pausable {
             _withdrawFeeFactor,
             _slippageFactor,
             _uniRouterAddress,
+            _rewardAddress,
             _referralCode
         );
     }
