@@ -2,6 +2,7 @@
 
 pragma solidity 0.6.12;
 
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/math/SafeMath.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/token/ERC20/ERC20.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/token/ERC20/SafeERC20.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/utils/ReentrancyGuard.sol";
@@ -21,16 +22,25 @@ contract IFO is ReentrancyGuard, Governor {
   uint256 public startBlock;
   uint256 public endBlock;
 
-  IERC20 public stakeToken;
-  IERC20 public offeringToken;
+  // The token used to buy offeringToken e.g. USDC
+  address public purchaseToken;
+  uint256 public purchaseDecimal;
+  // The token used to burn during buy e.g. FISH
+  address public burnToken;
+  uint256 public burnDecimal;
+  // purchaseToken:burnToken
+  uint256 public tokenRatio;
 
-  // Total amount of raising tokens need to be raised
+  // The offered token
+  IERC20 public offeringToken;
+  // The total amount of burnToken needed to buy all offeringTokens
+  // We use burnToken as the purchaseToken amount is based on burnToken*tokenRatio
   uint256 public raisingAmount;
-  // Total amount of offeringToken that will offer
+  // The total amount of offeringTokens to sell
   uint256 public offeringAmount;
   // Total raised amount of burnToken, can be higher than raisingAmount
   uint256 public totalAmount;
-
+  
   mapping (address => UserInfo) public userInfo;
   address[] public addressList;
 
@@ -39,20 +49,27 @@ contract IFO is ReentrancyGuard, Governor {
   event Harvest(address indexed user, uint256 offeringAmount, uint256 excessAmount);
 
   constructor(
-      IERC20 _stakeToken,
+      address _purchaseToken,
+      address _burnToken,
+      uint256 _tokenRatio,
       IERC20 _offeringToken,
       uint256 _startBlock,
       uint256 _endBlock,
       uint256 _offeringAmount,
-      uint256 _raisingAmount
+      uint256 _raisingAmount,
+      address _govAddress
   ) public {
-      stakeToken = _stakeToken;
+      purchaseToken = _purchaseToken;
+      purchaseDecimal = uint256(10) ** ERC20(purchaseToken).decimals();
+      burnToken = _burnToken;
+      burnDecimal = uint256(10) ** ERC20(burnToken).decimals();
+      tokenRatio = _tokenRatio;
       offeringToken = _offeringToken;
       startBlock = _startBlock;
       endBlock = _endBlock;
       offeringAmount = _offeringAmount;
       raisingAmount = _raisingAmount;
-      govAddress = msg.sender;
+      govAddress = _govAddress;
   }
 
   function setOfferingAmount(uint256 _offerAmount) external onlyGov {
@@ -65,18 +82,17 @@ contract IFO is ReentrancyGuard, Governor {
     raisingAmount = _raisingAmount;
   }
 
-  function deposit(uint256 _amount) external {
+  function deposit(uint256 _amount) external nonReentrant {
     require (block.number > startBlock && block.number < endBlock, 'Has not started');
-    require (_amount > 0, 'need _amount > 0');
-    uint256 preStakeBalance = getTotalStakeTokenBalance();
-    stakeToken.safeTransferFrom(address(msg.sender), address(this), _amount);
+    require (_amount > 0, 'Cannot deposit zero');
+    IERC20(burnToken).safeTransferFrom(address(msg.sender), address(this), _amount);
+    IERC20(purchaseToken).safeTransferFrom(address(msg.sender), address(this), _amount.mul(tokenRatio).mul(purchaseDecimal).div(burnDecimal));
     if (userInfo[msg.sender].amount == 0) {
       addressList.push(address(msg.sender));
     }
-    uint256 finalDepositAmount = getTotalStakeTokenBalance().sub(preStakeBalance);
-    userInfo[msg.sender].amount = userInfo[msg.sender].amount.add(finalDepositAmount);
-    totalAmount = totalAmount.add(finalDepositAmount);
-    emit Deposit(msg.sender, finalDepositAmount);
+    userInfo[msg.sender].amount = userInfo[msg.sender].amount.add(_amount);
+    totalAmount = totalAmount.add(_amount);
+    emit Deposit(msg.sender, _amount);
   }
 
   function harvest() external nonReentrant {
@@ -87,7 +103,8 @@ contract IFO is ReentrancyGuard, Governor {
     uint256 refundingTokenAmount = getRefundingAmount(msg.sender);
     offeringToken.safeTransfer(address(msg.sender), offeringTokenAmount);
     if (refundingTokenAmount > 0) {
-      stakeToken.safeTransfer(address(msg.sender), refundingTokenAmount);
+      IERC20(burnToken).safeTransfer(address(msg.sender), refundingTokenAmount);
+      IERC20(purchaseToken).safeTransfer(address(msg.sender), refundingTokenAmount.mul(tokenRatio).mul(purchaseDecimal).div(burnDecimal));
     }
     userInfo[msg.sender].claimed = true;
     emit Harvest(msg.sender, offeringTokenAmount, refundingTokenAmount);
@@ -97,21 +114,16 @@ contract IFO is ReentrancyGuard, Governor {
       return userInfo[_user].claimed;
   }
 
-  // allocation 100000 means 0.1(10%), 1 meanss 0.000001(0.0001%), 1000000 means 1(100%)
+  // allocation 100000 means 0.1(10%), 1 means 0.000001(0.0001%), 1000000 means 1(100%)
   function getUserAllocation(address _user) public view returns(uint256) {
-    return userInfo[_user].amount.mul(1e12).div(totalAmount).div(1e6);
-  }
-
-  // allocation 100000 means 0.1(10%), 1 meanss 0.000001(0.0001%), 1000000 means 1(100%)
-  function getTotalStakeTokenBalance() public view returns(uint256) {
-    return stakeToken.balanceOf(address(this));
+    return userInfo[_user].amount.mul(1e36).div(totalAmount).div(1e18);
   }
 
   // get the amount of IFO token you will get
   function getOfferingAmount(address _user) public view returns(uint256) {
     if (totalAmount > raisingAmount) {
       uint256 allocation = getUserAllocation(_user);
-      return offeringAmount.mul(allocation).div(1e6);
+      return offeringAmount.mul(allocation).div(1e18);
     }
     else {
       // userInfo[_user] / (raisingAmount / offeringAmount)
@@ -125,7 +137,7 @@ contract IFO is ReentrancyGuard, Governor {
       return 0;
     }
     uint256 allocation = getUserAllocation(_user);
-    uint256 payAmount = raisingAmount.mul(allocation).div(1e6);
+    uint256 payAmount = raisingAmount.mul(allocation).div(1e18);
     return userInfo[_user].amount.sub(payAmount);
   }
 
@@ -138,23 +150,20 @@ contract IFO is ReentrancyGuard, Governor {
     offeringToken.safeTransfer(address(msg.sender), offeringToken.balanceOf(address(this)));
   }
 
-  function finalWithdraw(uint256 _stakeTokenAmount, uint256 _offerAmount) external onlyGov {
+  function finalWithdraw() external onlyGov {
     require (block.number > endBlock, 'Dont rugpull');
-    uint256 stakeBalance = getTotalStakeTokenBalance();
-    require (_stakeTokenAmount <= stakeBalance, 'not enough stakeToken');
-    require (_offerAmount <= offeringToken.balanceOf(address(this)), 'not enough reward token');
-    stakeToken.safeTransfer(address(msg.sender), _stakeTokenAmount);
-    offeringToken.safeTransfer(address(msg.sender), _offerAmount);
+    if (totalAmount < raisingAmount) {
+        IERC20(burnToken).safeTransfer(address(msg.sender), totalAmount);
+        IERC20(purchaseToken).safeTransfer(address(msg.sender), totalAmount.mul(tokenRatio).mul(purchaseDecimal).div(burnDecimal));
+        offeringToken.safeTransfer(address(msg.sender), offeringAmount.mul(raisingAmount.sub(totalAmount)).div(raisingAmount));
+    } else {
+        IERC20(burnToken).safeTransfer(address(msg.sender), raisingAmount);
+        IERC20(purchaseToken).safeTransfer(address(msg.sender), raisingAmount.mul(tokenRatio).mul(purchaseDecimal).div(burnDecimal));
+    }
   }
 
   // If something breaks
   function updateEndBlock(uint256 _endBlock) external onlyGov {
     endBlock = _endBlock;
-  }
-
-  // If something breaks
-  function updateStartBlock(uint256 _startBlock) external onlyGov {
-    require (block.number < startBlock, 'Cannot change after start');
-    startBlock = _startBlock;
   }
 }
